@@ -17,13 +17,16 @@
 // #define LOG_NDEBUG 0
 #include "VirtualDisplaySurface.h"
 #include "HWComposer.h"
-#include <cutils/properties.h>
-#if QCOM_BSP
-#include <gralloc_priv.h>
-#endif
+
 // ---------------------------------------------------------------------------
 namespace android {
 // ---------------------------------------------------------------------------
+
+#if defined(FORCE_HWC_COPY_FOR_VIRTUAL_DISPLAYS)
+static const bool sForceHwcCopy = true;
+#else
+static const bool sForceHwcCopy = false;
+#endif
 
 #define VDS_LOGE(msg, ...) ALOGE("[%s] " msg, \
         mDisplayName.string(), ##__VA_ARGS__)
@@ -42,34 +45,29 @@ static const char* dbgCompositionTypeStr(DisplaySurface::CompositionType type) {
     }
 }
 
-VirtualDisplaySurface::VirtualDisplaySurface(HWComposer& hwc,
-        int32_t &hwcDisplayId,
+VirtualDisplaySurface::VirtualDisplaySurface(HWComposer& hwc, int32_t dispId,
         const sp<IGraphicBufferProducer>& sink,
         const sp<IGraphicBufferProducer>& bqProducer,
         const sp<IGraphicBufferConsumer>& bqConsumer,
-        const String8& name,
-        bool secure)
+        const String8& name)
 :   ConsumerBase(bqConsumer),
     mHwc(hwc),
-    mDisplayId(NO_MEMORY),
+    mDisplayId(dispId),
     mDisplayName(name),
     mOutputUsage(GRALLOC_USAGE_HW_COMPOSER),
     mProducerSlotSource(0),
     mDbgState(DBG_STATE_IDLE),
     mDbgLastCompositionType(COMPOSITION_UNKNOWN),
-    mMustRecompose(false),
-    mForceHwcCopy(false),
-    mSecure(false)
+    mMustRecompose(false)
 {
     mSource[SOURCE_SINK] = sink;
     mSource[SOURCE_SCRATCH] = bqProducer;
 
-    int sinkWidth, sinkHeight, sinkFormat, sinkUsage;
+    resetPerFrameState();
+
+    int sinkWidth, sinkHeight;
     sink->query(NATIVE_WINDOW_WIDTH, &sinkWidth);
     sink->query(NATIVE_WINDOW_HEIGHT, &sinkHeight);
-    sink->query(NATIVE_WINDOW_FORMAT, &sinkFormat);
-    sink->query(NATIVE_WINDOW_CONSUMER_USAGE_BITS, &sinkUsage);
-
     mSinkBufferWidth = sinkWidth;
     mSinkBufferHeight = sinkHeight;
 
@@ -77,46 +75,16 @@ VirtualDisplaySurface::VirtualDisplaySurface(HWComposer& hwc,
     // with GLES. If the consumer needs CPU access, use the default format
     // set by the consumer. Otherwise allow gralloc to decide the format based
     // on usage bits.
-    mDefaultOutputFormat = sinkFormat;
-    if((sinkUsage & GRALLOC_USAGE_HW_VIDEO_ENCODER)
-#if QCOM_BSP
-            && (sinkUsage & GRALLOC_USAGE_PRIVATE_WFD)
-#endif
-      )
-    {
+    int sinkUsage;
+    sink->query(NATIVE_WINDOW_CONSUMER_USAGE_BITS, &sinkUsage);
+    if (sinkUsage & (GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK)) {
+        int sinkFormat;
+        sink->query(NATIVE_WINDOW_FORMAT, &sinkFormat);
+        mDefaultOutputFormat = sinkFormat;
+    } else {
         mDefaultOutputFormat = HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
-        mForceHwcCopy = true;
-        //Set secure flag only if the session requires HW protection, currently
-        //there is no other way to distinguish different security protection levels
-        //This allows Level-3 sessions(eg.simulated displayes) to get
-        //buffers from IOMMU heap and not MM (secure) heap.
-        mSecure = secure;
     }
-
-    // XXX: With this debug property we can allow screenrecord to be composed
-    // via HWC. This is useful for debugging purposes, for example when WFD
-    // is not working on a particular build.
-    char value[PROPERTY_VALUE_MAX];
-    if( (property_get("debug.hwc.screenrecord", value, NULL) > 0) &&
-        ((!strncmp(value, "1", strlen("1"))) ||
-        !strncasecmp(value, "true", strlen("true")))) {
-        mForceHwcCopy = true;
-    }
-
-    // Once the mForceHwcCopy flag is set, we can freely allocate an HWC
-    // display ID.
-    if (mForceHwcCopy &&  mHwc.isVDSEnabled())
-        mDisplayId =  mHwc.allocateDisplayId();
-
-    hwcDisplayId = mDisplayId; //update display id for device creation in SF
-
     mOutputFormat = mDefaultOutputFormat;
-    // TODO: need to add the below logs as part of dumpsys output
-    VDS_LOGV("creation: sinkFormat: 0x%x sinkUsage: 0x%x mForceHwcCopy: %d",
-            mOutputFormat, sinkUsage, mForceHwcCopy);
-
-    setOutputUsage();
-    resetPerFrameState();
 
     ConsumerBase::mName = String8::format("VDS: %s", mDisplayName.string());
     mConsumer->setConsumerName(ConsumerBase::mName);
@@ -126,22 +94,6 @@ VirtualDisplaySurface::VirtualDisplaySurface(HWComposer& hwc,
 }
 
 VirtualDisplaySurface::~VirtualDisplaySurface() {
-}
-
-// helper to update the output usage when the display is secure
-void VirtualDisplaySurface::setOutputUsage() {
-    mOutputUsage = GRALLOC_USAGE_HW_COMPOSER;
-    if (mSecure) {
-        //TODO: Currently, the framework can only say whether the display
-        //and its subsequent session are secure or not. However, there is
-        //no mechanism to distinguish the different levels of security.
-        //The current solution assumes WV L3 protection.
-        mOutputUsage |= GRALLOC_USAGE_PROTECTED;
-#ifdef QCOM_BSP
-        mOutputUsage |= GRALLOC_USAGE_PRIVATE_MM_HEAP |
-                        GRALLOC_USAGE_PRIVATE_UNCACHED;
-#endif
-    }
 }
 
 status_t VirtualDisplaySurface::beginFrame(bool mustRecompose) {
@@ -166,7 +118,7 @@ status_t VirtualDisplaySurface::prepareFrame(CompositionType compositionType) {
     mDbgState = DBG_STATE_PREPARED;
 
     mCompositionType = compositionType;
-    if (mForceHwcCopy) {
+    if (sForceHwcCopy && mCompositionType == COMPOSITION_GLES) {
         // Some hardware can do RGB->YUV conversion more efficiently in hardware
         // controlled by HWC than in hardware controlled by the video encoder.
         // Forcing GLES-composed frames to go through an extra copy by the HWC
@@ -198,7 +150,7 @@ status_t VirtualDisplaySurface::prepareFrame(CompositionType compositionType) {
         // format/usage and get a new buffer when the GLES driver calls
         // dequeueBuffer().
         mOutputFormat = mDefaultOutputFormat;
-        setOutputUsage();
+        mOutputUsage = GRALLOC_USAGE_HW_COMPOSER;
         refreshOutputBuffer();
     }
 
@@ -213,20 +165,7 @@ status_t VirtualDisplaySurface::advanceFrame() {
     if (mDisplayId < 0)
         return NO_ERROR;
 
-    // When mForceHwcCopy is true, we override the composition type to MIXED.
-    // Therefore, we need to check whether we are in this scenario and add
-    // checks to satisfy the state machine requirements and reduce log spam.
-    // In particular, by setting mForceHwcCopy we can now expect to get an
-    // advanceFrame when composition type is MIXED and our previous state was
-    // PREPARED or GLES_DONE.
-    if (mForceHwcCopy && (mCompositionType == COMPOSITION_MIXED)) {
-        bool isValidState = (mDbgState == DBG_STATE_PREPARED) ||
-                (mDbgState == DBG_STATE_GLES_DONE);
-        VDS_LOGW_IF(!isValidState,
-                "Unexpected advanceFrame() in %s state on %s frame",
-                dbgStateStr(),
-                (mDbgState == DBG_STATE_PREPARED) ? "HWC" : "GLES/MIXED");
-    } else if (mCompositionType == COMPOSITION_HWC) {
+    if (mCompositionType == COMPOSITION_HWC) {
         VDS_LOGW_IF(mDbgState != DBG_STATE_PREPARED,
                 "Unexpected advanceFrame() in %s state on HWC frame",
                 dbgStateStr());
@@ -237,7 +176,8 @@ status_t VirtualDisplaySurface::advanceFrame() {
     }
     mDbgState = DBG_STATE_HWC;
 
-    if (mOutputProducerSlot < 0) {
+    if (mOutputProducerSlot < 0 ||
+            (mCompositionType != COMPOSITION_HWC && mFbProducerSlot < 0)) {
         // Last chance bailout if something bad happened earlier. For example,
         // in a GLES configuration, if the sink disappears then dequeueBuffer
         // will fail, the GLES driver won't queue a buffer, but SurfaceFlinger
@@ -275,7 +215,7 @@ void VirtualDisplaySurface::onFrameCommitted() {
     mDbgState = DBG_STATE_IDLE;
 
     sp<Fence> fbFence = mHwc.getAndResetReleaseFence(mDisplayId);
-    if (mFbProducerSlot >= 0) {
+    if (mCompositionType == COMPOSITION_MIXED && mFbProducerSlot >= 0) {
         // release the scratch buffer back to the pool
         Mutex::Autolock lock(mMutex);
         int sslot = mapProducer2SourceSlot(SOURCE_SCRATCH, mFbProducerSlot);
@@ -290,10 +230,7 @@ void VirtualDisplaySurface::onFrameCommitted() {
         QueueBufferOutput qbo;
         sp<Fence> outFence = mHwc.getLastRetireFence(mDisplayId);
         VDS_LOGV("onFrameCommitted: queue sink sslot=%d", sslot);
-        // Allow queuing to sink buffer if mMustRecompose is true or
-        // mForceHwcCopy is true. This is required to support Miracast WFD Sink
-        // Initiatied Pause/Resume feature support
-        if (mForceHwcCopy || mMustRecompose) {
+        if (mMustRecompose) {
             status_t result = mSource[SOURCE_SINK]->queueBuffer(sslot,
                     QueueBufferInput(
                         systemTime(), false /* isAutoTimestamp */,
@@ -521,7 +458,7 @@ status_t VirtualDisplaySurface::queueBuffer(int pslot,
         uint32_t transform;
         bool async;
         input.deflate(&timestamp, &isAutoTimestamp, &crop, &scalingMode,
-               &transform, &async, &mFbFence);
+                &transform, &async, &mFbFence);
 
         mFbProducerSlot = pslot;
         mOutputFence = mFbFence;
@@ -584,12 +521,6 @@ void VirtualDisplaySurface::allocateBuffers(bool /* async */,
         uint32_t /* usage */) {
     // TODO: Should we actually allocate buffers for a virtual display?
 }
-
-#ifdef QCOM_BSP_LEGACY
-status_t VirtualDisplaySurface::setBuffersSize(int size) {
-   return mSource[SOURCE_SINK]->setBuffersSize(size);
-}
-#endif
 
 void VirtualDisplaySurface::updateQueueBufferOutput(
         const QueueBufferOutput& qbo) {

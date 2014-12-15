@@ -25,9 +25,6 @@
 #include <stdatomic.h>
 
 #include <EGL/egl.h>
-#ifdef USE_MHEAP_SCREENSHOT
-#include <GLES/gl.h>
-#endif
 
 #include <cutils/log.h>
 #include <cutils/properties.h>
@@ -80,13 +77,6 @@
 
 #include "RenderEngine/RenderEngine.h"
 #include <cutils/compiler.h>
-#ifdef QCOM_BSP
-#include <gralloc_priv.h>
-#endif
-
-#ifdef QCOM_BSP
-#include <display_config.h>
-#endif
 
 #define DISPLAY_COUNT       1
 
@@ -133,10 +123,6 @@ const String16 sReadFramebuffer("android.permission.READ_FRAME_BUFFER");
 const String16 sDump("android.permission.DUMP");
 
 // ---------------------------------------------------------------------------
-// Initialize extendedMode to false
-#ifdef QCOM_BSP
-bool SurfaceFlinger::sExtendedMode = false;
-#endif
 
 SurfaceFlinger::SurfaceFlinger()
     :   BnSurfaceComposer(),
@@ -159,7 +145,6 @@ SurfaceFlinger::SurfaceFlinger()
         mDebugInTransaction(0),
         mLastTransactionTime(0),
         mBootFinished(false),
-        mGpuTileRenderEnable(false),
         mPrimaryHWVsyncEnabled(false),
         mHWVsyncAvailable(false),
         mDaltonize(false),
@@ -184,18 +169,6 @@ SurfaceFlinger::SurfaceFlinger()
             mDebugDDMS = 0;
         }
     }
-#ifdef QCOM_BSP
-    mCanUseGpuTileRender = false;
-    property_get("debug.sf.gpu_comp_tiling", value, "0");
-    mGpuTileRenderEnable = atoi(value) ? true : false;
-    if(mGpuTileRenderEnable)
-       ALOGV("DirtyRect optimization enabled for FULL GPU Composition");
-    mUnionDirtyRect.clear();
-
-    property_get("sys.disable_ext_animation", value, "0");
-    mDisableExtAnimation = atoi(value) ? true : false;
-#endif
-
     ALOGI_IF(mDebugRegion, "showupdates enabled");
     ALOGI_IF(mDebugDDMS, "DDMS debugging enabled");
 }
@@ -281,13 +254,13 @@ void SurfaceFlinger::destroyDisplay(const sp<IBinder>& display) {
     setTransactionFlags(eDisplayTransactionNeeded);
 }
 
-void SurfaceFlinger::createBuiltinDisplayLocked(DisplayDevice::DisplayType type,
-                                                bool secure) {
+void SurfaceFlinger::createBuiltinDisplayLocked(DisplayDevice::DisplayType type) {
     ALOGW_IF(mBuiltinDisplays[type],
             "Overwriting display token for display type %d", type);
     mBuiltinDisplays[type] = new BBinder();
     DisplayDeviceState info(type);
-    info.isSecure = secure;
+    // All non-virtual displays are currently considered secure.
+    info.isSecure = true;
     mCurrentState.displays.add(mBuiltinDisplays[type], info);
 }
 
@@ -418,12 +391,6 @@ void SurfaceFlinger::init() {
     status_t err;
     Mutex::Autolock _l(mStateLock);
 
-    /* Set the mask bit of the sigset to block the SIGPIPE signal */
-    sigset_t sigMask;
-    sigemptyset (&sigMask);
-    sigaddset(&sigMask, SIGPIPE);
-    sigprocmask(SIG_BLOCK, &sigMask, NULL);
-
     // initialize EGL for the default display
     mEGLDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     eglInitialize(mEGLDisplay, NULL, NULL);
@@ -447,14 +414,9 @@ void SurfaceFlinger::init() {
         DisplayDevice::DisplayType type((DisplayDevice::DisplayType)i);
         // set-up the displays that are already connected
         if (mHwc->isConnected(i) || type==DisplayDevice::DISPLAY_PRIMARY) {
-#ifdef QCOM_BSP
-            // query from hwc if the non-virtual display is secure.
-            bool isSecure = mHwc->isSecure(i);;
-#else
-            // All non-virtual displays are currently considered secure
+            // All non-virtual displays are currently considered secure.
             bool isSecure = true;
-#endif
-            createBuiltinDisplayLocked(type, isSecure);
+            createBuiltinDisplayLocked(type);
             wp<IBinder> token = mBuiltinDisplays[i];
 
             sp<IGraphicBufferProducer> producer;
@@ -518,7 +480,6 @@ int32_t SurfaceFlinger::allocateHwcDisplayId(DisplayDevice::DisplayType type) {
 
 void SurfaceFlinger::startBootAnim() {
     // start boot animation
-    mBootFinished = false;
     property_set("service.bootanim.exit", "0");
     property_set("ctl.start", "bootanim");
 }
@@ -542,7 +503,7 @@ bool SurfaceFlinger::authenticateSurfaceTexture(
 
 status_t SurfaceFlinger::getDisplayConfigs(const sp<IBinder>& display,
         Vector<DisplayInfo>* configs) {
-    if ((configs == NULL) || (display.get() == NULL)) {
+    if (configs == NULL) {
         return BAD_VALUE;
     }
 
@@ -612,19 +573,10 @@ status_t SurfaceFlinger::getDisplayConfigs(const sp<IBinder>& display,
             info.orientation = 0;
         }
 
-        int additionalRot = mDisplays[0]->getHardwareOrientation() / 90;
-        if ((type == DisplayDevice::DISPLAY_PRIMARY) && (additionalRot & DisplayState::eOrientationSwapMask)) {
-            info.h = hwConfig.width;
-            info.w = hwConfig.height;
-            info.xdpi = ydpi;
-            info.ydpi = xdpi;
-        }
-        else {
-            info.w = hwConfig.width;
-            info.h = hwConfig.height;
-            info.xdpi = xdpi;
-            info.ydpi = ydpi;
-        }
+        info.w = hwConfig.width;
+        info.h = hwConfig.height;
+        info.xdpi = xdpi;
+        info.ydpi = ydpi;
         info.fps = float(1e9 / hwConfig.refresh);
         info.appVsyncOffset = VSYNC_EVENT_PHASE_OFFSET_NS;
 
@@ -643,13 +595,9 @@ status_t SurfaceFlinger::getDisplayConfigs(const sp<IBinder>& display,
         info.presentationDeadline =
                 hwConfig.refresh - SF_VSYNC_EVENT_PHASE_OFFSET_NS + 1000000;
 
-#ifdef QCOM_BSP
-        // set secure info based on the hwcConfig
-        info.secure = hwConfig.secure;
-#else
         // All non-virtual displays are currently considered secure.
         info.secure = true;
-#endif
+
         configs->push_back(info);
     }
 
@@ -689,10 +637,8 @@ void SurfaceFlinger::setActiveConfigInternal(const sp<DisplayDevice>& hw, int mo
         return;
     }
 
-    status_t status = getHwComposer().setActiveConfig(type, mode);
-    if (status == NO_ERROR) {
-        hw->setActiveConfig(mode);
-    }
+    hw->setActiveConfig(mode);
+    getHwComposer().setActiveConfig(type, mode);
 }
 
 status_t SurfaceFlinger::setActiveConfig(const sp<IBinder>& display, int mode) {
@@ -861,24 +807,10 @@ void SurfaceFlinger::onHotplugReceived(int type, bool connected) {
     if (uint32_t(type) < DisplayDevice::NUM_BUILTIN_DISPLAY_TYPES) {
         Mutex::Autolock _l(mStateLock);
         if (connected) {
-#ifdef QCOM_BSP
-            // query from hwc if the connected display is secure
-            bool secure = mHwc->isSecure(type);;
-#else
-            // All non-virtual displays are currently considered secure.
-            bool secure = true;
-#endif
-            createBuiltinDisplayLocked((DisplayDevice::DisplayType)type, secure);
+            createBuiltinDisplayLocked((DisplayDevice::DisplayType)type);
         } else {
             mCurrentState.displays.removeItem(mBuiltinDisplays[type]);
             mBuiltinDisplays[type].clear();
-#ifdef QCOM_BSP
-            // if extended_mode is set, and set mVisibleRegionsDirty
-            // as we need to rebuildLayerStack
-            if(isExtendedMode()) {
-                mVisibleRegionsDirty = true;
-            }
-#endif
         }
         setTransactionFlags(eDisplayTransactionNeeded);
 
@@ -920,24 +852,11 @@ void SurfaceFlinger::handleMessageInvalidate() {
     handlePageFlip();
 }
 
-#ifdef QCOM_BSP
-/* Compute DirtyRegion, if DR optimization for GPU comp optimization
- * is ON & and no external device is connected.*/
-void SurfaceFlinger::setUpTiledDr() {
-    if(mGpuTileRenderEnable && (mDisplays.size()==1)) {
-        const sp<DisplayDevice>& hw(mDisplays[HWC_DISPLAY_PRIMARY]);
-        mCanUseGpuTileRender = computeTiledDr(hw);
-    }
-}
-#endif
 void SurfaceFlinger::handleMessageRefresh() {
     ATRACE_CALL();
     preComposition();
     rebuildLayerStacks();
     setUpHWComposer();
-#ifdef QCOM_BSP
-    setUpTiledDr();
-#endif
     doDebugFlashRegions();
     doComposition();
     postComposition();
@@ -952,45 +871,20 @@ void SurfaceFlinger::doDebugFlashRegions()
     const bool repaintEverything = mRepaintEverything;
     for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
         const sp<DisplayDevice>& hw(mDisplays[dpy]);
-
         if (hw->isDisplayOn()) {
-            const int32_t height = hw->getHeight();
-            RenderEngine& engine(getRenderEngine());
-#ifdef QCOM_BSP
-            // Use Union DR, if it is valid & GPU Tiled DR optimization is ON
-            if(mCanUseGpuTileRender && !mUnionDirtyRect.isEmpty()) {
+            // transform the dirty region into this screen's coordinate space
+            const Region dirtyRegion(hw->getDirtyRegion(repaintEverything));
+            if (!dirtyRegion.isEmpty()) {
                 // redraw the whole screen
                 doComposeSurfaces(hw, Region(hw->bounds()));
-                Region dirtyRegion(mUnionDirtyRect);
-                Rect dr = mUnionDirtyRect;
-                hw->eglSwapPreserved(true);
-                engine.startTileComposition(dr.left, (height-dr.bottom),
-                      (dr.right-dr.left),
-                      (dr.bottom-dr.top), 1);
+
                 // and draw the dirty region
+                const int32_t height = hw->getHeight();
+                RenderEngine& engine(getRenderEngine());
                 engine.fillRegionWithColor(dirtyRegion, height, 1, 0, 1, 1);
-                engine.endTileComposition(GL_PRESERVE);
+
                 hw->compositionComplete();
                 hw->swapBuffers(getHwComposer());
-            } else
-#endif
-            {
-                // transform the dirty region into this screen's coordinate
-                // space
-                const Region dirtyRegion(hw->getDirtyRegion(repaintEverything));
-                if (!dirtyRegion.isEmpty()) {
-                   // redraw the whole screen
-                   doComposeSurfaces(hw, Region(hw->bounds()));
-                   // and draw the dirty region
-#ifdef QCOM_BSP
-                   if(mGpuTileRenderEnable)
-                       hw->eglSwapPreserved(false);
-#endif
-
-                   engine.fillRegionWithColor(dirtyRegion, height, 1, 0, 1, 1);
-                   hw->compositionComplete();
-                   hw->swapBuffers(getHwComposer());
-               }
             }
         }
     }
@@ -1065,11 +959,6 @@ void SurfaceFlinger::postComposition()
 }
 
 void SurfaceFlinger::rebuildLayerStacks() {
-#ifdef QCOM_BSP
-    char prop[PROPERTY_VALUE_MAX];
-    property_get("sys.extended_mode", prop, "0");
-    sExtendedMode = atoi(prop) ? true : false;
-#endif
     // rebuild the visible layer list per screen
     if (CC_UNLIKELY(mVisibleRegionsDirty)) {
         ATRACE_CALL();
@@ -1084,20 +973,21 @@ void SurfaceFlinger::rebuildLayerStacks() {
             const sp<DisplayDevice>& hw(mDisplays[dpy]);
             const Transform& tr(hw->getTransform());
             const Rect bounds(hw->getBounds());
-            int dpyId = hw->getHwcDisplayId();
             if (hw->isDisplayOn()) {
-                SurfaceFlinger::computeVisibleRegions(dpyId, layers,
+                SurfaceFlinger::computeVisibleRegions(layers,
                         hw->getLayerStack(), dirtyRegion, opaqueRegion);
 
                 const size_t count = layers.size();
                 for (size_t i=0 ; i<count ; i++) {
                     const sp<Layer>& layer(layers[i]);
                     const Layer::State& s(layer->getDrawingState());
-                    Region drawRegion(tr.transform(
-                            layer->visibleNonTransparentRegion));
-                    drawRegion.andSelf(bounds);
-                    if (!drawRegion.isEmpty()) {
-                        layersSortedByZ.add(layer);
+                    if (s.layerStack == hw->getLayerStack()) {
+                        Region drawRegion(tr.transform(
+                                layer->visibleNonTransparentRegion));
+                        drawRegion.andSelf(bounds);
+                        if (!drawRegion.isEmpty()) {
+                            layersSortedByZ.add(layer);
+                        }
                     }
                 }
             }
@@ -1171,31 +1061,6 @@ void SurfaceFlinger::setUpHWComposer() {
             sp<const DisplayDevice> hw(mDisplays[dpy]);
             const int32_t id = hw->getHwcDisplayId();
             if (id >= 0) {
-                // Get the layers in the current drawying state
-                const LayerVector& layers(mDrawingState.layersSortedByZ);
-#ifdef QCOM_BSP
-                bool freezeSurfacePresent = false;
-                const size_t layerCount = layers.size();
-                // Look for ScreenShotSurface in external layer list, only when
-                // disable external rotation animation feature is enabled
-                if(mDisableExtAnimation && (id != HWC_DISPLAY_PRIMARY)) {
-                    for (size_t i = 0 ; i < layerCount ; ++i) {
-                        static int screenShotLen = strlen("ScreenshotSurface");
-                        const sp<Layer>& layer(layers[i]);
-                        const Layer::State& s(layer->getDrawingState());
-                        // check the layers associated with external display
-                        if(s.layerStack == hw->getLayerStack()) {
-                            if(!strncmp(layer->getName(), "ScreenshotSurface",
-                                    screenShotLen)) {
-                                // Screenshot layer is present, and animation in
-                                // progress
-                                freezeSurfacePresent = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-#endif
                 const Vector< sp<Layer> >& currentLayers(
                     hw->getVisibleLayersSortedByZ());
                 const size_t count = currentLayers.size();
@@ -1208,24 +1073,6 @@ void SurfaceFlinger::setUpHWComposer() {
                      */
                     const sp<Layer>& layer(currentLayers[i]);
                     layer->setPerFrameData(hw, *cur);
-#ifdef QCOM_BSP
-                    if(freezeSurfacePresent) {
-                        // if freezeSurfacePresent, set ANIMATING flag
-                        cur->setAnimating(true);
-                    } else {
-                        const KeyedVector<wp<IBinder>, DisplayDeviceState>&
-                                                draw(mDrawingState.displays);
-                        size_t dc = draw.size();
-                        for (size_t i=0 ; i<dc ; i++) {
-                            if (draw[i].isMainDisplay()) {
-                                 // Pass the current orientation to HWC
-                                 hwc.eventControl(HWC_DISPLAY_PRIMARY,
-                                         SurfaceFlinger::EVENT_ORIENTATION,
-                                         uint32_t(draw[i].orientation));
-                            }
-                        }
-                    }
-#endif
                 }
             }
         }
@@ -1363,107 +1210,6 @@ void SurfaceFlinger::handleTransaction(uint32_t transactionFlags)
     // here the transaction has been committed
 }
 
-void SurfaceFlinger::setVirtualDisplayData(
-    int32_t hwcDisplayId,
-    const sp<IGraphicBufferProducer>& sink)
-{
-    sp<ANativeWindow> mNativeWindow = new Surface(sink);
-    ANativeWindow* const window = mNativeWindow.get();
-
-    int format;
-    window->query(window, NATIVE_WINDOW_FORMAT, &format);
-
-    EGLSurface surface;
-    EGLint w, h;
-    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    surface = eglCreateWindowSurface(display, mRenderEngine->getEGLConfig(), window, NULL);
-    eglQuerySurface(display, surface, EGL_WIDTH,  &w);
-    eglQuerySurface(display, surface, EGL_HEIGHT, &h);
-
-    mHwc->setVirtualDisplayProperties(hwcDisplayId, w, h, format);
-}
-
-void SurfaceFlinger::configureVirtualDisplay(int32_t &hwcDisplayId,
-                                        sp<DisplaySurface> &dispSurface,
-                                        sp<IGraphicBufferProducer> &producer,
-                                        const DisplayDeviceState state,
-                                        sp<IGraphicBufferProducer> bqProducer,
-                                        sp<IGraphicBufferConsumer> bqConsumer)
-{
-    bool vdsEnabled = mHwc->isVDSEnabled();
-
-    //for V4L2 based virtual display implementation
-    if(!vdsEnabled) {
-        // persist.sys.wfd.virtual will be set if WFD is launched via
-        // settings app. This is currently being done in
-        // ExtendedRemoteDisplay-WFD stack.
-        // This flag will be reset at the time of disconnection of virtual WFD
-        // display.
-        // This flag is set to zero if WFD is launched via QCOM WFD
-        // proprietary APIs which use HDMI piggyback approach.
-        char value[PROPERTY_VALUE_MAX];
-        property_get("persist.sys.wfd.virtual", value, "0");
-        int wfdVirtual = atoi(value);
-        if(!wfdVirtual) {
-            // This is for non-wfd virtual display scenarios(e.g. SSD/SR/CTS)
-            sp<VirtualDisplaySurface> vds = new VirtualDisplaySurface(*mHwc,
-                    hwcDisplayId, state.surface, bqProducer, bqConsumer,
-                    state.displayName, state.isSecure);
-            dispSurface = vds;
-            // There won't be any interaction with HWC for this virtual display.
-            // so the GLES driver can pass buffers directly to the sink.
-            producer = state.surface;
-        } else {
-            int sinkUsage = -1;
-            state.surface->query(NATIVE_WINDOW_CONSUMER_USAGE_BITS, &sinkUsage);
-#ifdef QCOM_BSP
-            if(sinkUsage & GRALLOC_USAGE_PRIVATE_WFD)
-#endif
-                hwcDisplayId = allocateHwcDisplayId(state.type);
-
-            if (hwcDisplayId >= 0) {
-                // This is for WFD virtual display scenario.
-                // Read virtual display properties and create a
-                // rendering surface for it inorder to be handled by hwc.
-                setVirtualDisplayData(hwcDisplayId, state.surface);
-                dispSurface = new FramebufferSurface(*mHwc, state.type,
-                bqConsumer);
-                producer = bqProducer;
-            } else {
-                // in case of WFD Virtual + SSD/SR concurrency scenario,
-                // WFD virtual display instance gets valid hwcDisplayId and
-                // SSD/SR will get invalid hwcDisplayId
-                sp<VirtualDisplaySurface> vds = new VirtualDisplaySurface(*mHwc,
-                        hwcDisplayId, state.surface, bqProducer, bqConsumer,
-                        state.displayName, state.isSecure);
-                dispSurface = vds;
-                // There won't be any interaction with HWC for this virtual
-                // display, so the GLES driver can pass buffers directly to the
-                // sink.
-                producer = state.surface;
-            }
-        }
-    } else {
-        // VDS solution is enabled
-        // HWC is allocated for first virtual display.
-        // Subsequent virtual display sessions will be composed by GLES driver.
-        // ToDo: Modify VDS component to allocate hwcDisplayId based on
-        // mForceHwcCopy (which is based on Usage Flags)
-
-        sp<VirtualDisplaySurface> vds = new VirtualDisplaySurface(*mHwc,
-                hwcDisplayId, state.surface, bqProducer, bqConsumer,
-                state.displayName, state.isSecure);
-        dispSurface = vds;
-        if (hwcDisplayId >= 0) {
-            producer = vds;
-        } else {
-            // There won't be any interaction with HWC for this virtual display,
-            // so the GLES driver can pass buffers directly to the sink.
-            producer = state.surface;
-        }
-    }
-}
-
 void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
 {
     const LayerVector& currentLayers(mCurrentState.layersSortedByZ);
@@ -1552,40 +1298,8 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
                                 || (state.viewport != draw[i].viewport)
                                 || (state.frame != draw[i].frame))
                         {
-#ifdef QCOM_BSP
-                            int orient = state.orientation;
-                            // Honor the orientation change after boot
-                            // animation completes and make sure boot
-                            // animation is shown in panel orientation always.
-                            if(mBootFinished){
-                                disp->setProjection(state.orientation,
-                                        state.viewport, state.frame);
-                                orient = state.orientation;
-                            }
-                            else{
-                                char property[PROPERTY_VALUE_MAX];
-                                int panelOrientation =
-                                        DisplayState::eOrientationDefault;
-                                if(property_get("persist.panel.orientation",
-                                            property, "0") > 0){
-                                    panelOrientation = atoi(property) / 90;
-                                }
-                                disp->setProjection(panelOrientation,
-                                        state.viewport, state.frame);
-                                orient = panelOrientation;
-                            }
-                            // Set the view frame of each display only of its
-                            // default orientation.
-                            if(orient == DisplayState::eOrientationDefault and
-                                    state.frame.isValid()) {
-                                qdutils::setViewFrame(disp->getHwcDisplayId(),
-                                    state.frame.left, state.frame.top,
-                                    state.frame.right, state.frame.bottom);
-                            }
-#else
                             disp->setProjection(state.orientation,
-                                state.viewport, state.frame);
-#endif
+                                    state.viewport, state.frame);
                         }
                         if (state.width != draw[i].width || state.height != draw[i].height) {
                             disp->setDisplaySize(state.width, state.height);
@@ -1613,9 +1327,14 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
                         // they have external state (layer stack, projection,
                         // etc.) but no internal state (i.e. a DisplayDevice).
                         if (state.surface != NULL) {
-                            configureVirtualDisplay(hwcDisplayId,
-                                    dispSurface, producer, state, bqProducer,
-                                    bqConsumer);
+
+                            hwcDisplayId = allocateHwcDisplayId(state.type);
+                            sp<VirtualDisplaySurface> vds = new VirtualDisplaySurface(
+                                    *mHwc, hwcDisplayId, state.surface,
+                                    bqProducer, bqConsumer, state.displayName);
+
+                            dispSurface = vds;
+                            producer = vds;
                         }
                     } else {
                         ALOGE_IF(state.surface!=NULL,
@@ -1631,7 +1350,7 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
                     }
 
                     const wp<IBinder>& display(curr.keyAt(i));
-                    if (dispSurface != NULL && producer != NULL) {
+                    if (dispSurface != NULL) {
                         sp<DisplayDevice> hw = new DisplayDevice(this,
                                 state.type, hwcDisplayId,
                                 mHwc->getFormat(hwcDisplayId), state.isSecure,
@@ -1641,13 +1360,6 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
                         hw->setProjection(state.orientation,
                                 state.viewport, state.frame);
                         hw->setDisplayName(state.displayName);
-                        // When a new display device is added update the active
-                        // config by querying HWC otherwise the default config
-                        // (config 0) will be used.
-                        int activeConfig = mHwc->getActiveConfig(hwcDisplayId);
-                        if (activeConfig >= 0) {
-                            hw->setActiveConfig(activeConfig);
-                        }
                         mDisplays.add(display, hw);
                         if (state.isVirtualDisplay()) {
                             if (hwcDisplayId >= 0) {
@@ -1806,7 +1518,7 @@ void SurfaceFlinger::commitTransaction()
     mTransactionCV.broadcast();
 }
 
-void SurfaceFlinger::computeVisibleRegions(size_t dpy,
+void SurfaceFlinger::computeVisibleRegions(
         const LayerVector& currentLayers, uint32_t layerStack,
         Region& outDirtyRegion, Region& outOpaqueRegion)
 {
@@ -1817,68 +1529,18 @@ void SurfaceFlinger::computeVisibleRegions(size_t dpy,
     Region dirty;
 
     outDirtyRegion.clear();
-    bool bIgnoreLayers = false;
-    int indexLOI = -1;
+
     size_t i = currentLayers.size();
-#ifdef QCOM_BSP
-    while (i--) {
-        const sp<Layer>& layer = currentLayers[i];
-        // iterate through the layer list to find ext_only layers and store
-        // the index
-        if (layer->isSecureDisplay()) {
-            bIgnoreLayers = true;
-            indexLOI = -1;
-            if(!dpy)
-                indexLOI = i;
-            break;
-        }
-        // iterate through the layer list to find ext_only layers or yuv
-        // layer(extended_mode) and store the index
-        if ((dpy && (layer->isExtOnly() ||
-                     (isExtendedMode() && layer->isYuvLayer())))) {
-            bIgnoreLayers= true;
-            indexLOI = i;
-        }
-    }
-    i = currentLayers.size();
-#endif
     while (i--) {
         const sp<Layer>& layer = currentLayers[i];
 
         // start with the whole surface at its current location
         const Layer::State& s(layer->getDrawingState());
 
-#ifdef QCOM_BSP
-        // Only add the layer marked as "external_only" or yuvLayer
-        // (extended_mode) to external list and
-        // only remove the layer marked as "external_only" or yuvLayer in
-        // extended_mode from primary list
-        // and do not add the layer marked as "internal_only" to external list
-        // Add secure UI layers to primary and remove other layers from internal
-        //and external list
-        if(((bIgnoreLayers && indexLOI != (int)i) ||
-           (!dpy && layer->isExtOnly()) ||
-                     (!dpy && isExtendedMode() && layer->isYuvLayer()))||
-                     (dpy && layer->isIntOnly())) {
-            // Ignore all other layers except the layers marked as ext_only
-            // by setting visible non transparent region empty.
-            Region visibleNonTransRegion;
-            visibleNonTransRegion.set(Rect(0,0));
-            layer->setVisibleNonTransparentRegion(visibleNonTransRegion);
+        // only consider the layers on the given layer stack
+        if (s.layerStack != layerStack)
             continue;
-        }
-#endif
-        // only consider the layers on the given later stack
-        // Override layers created using presentation class by the layers having
-        // ext_only flag enabled
-        if(s.layerStack != layerStack && !bIgnoreLayers) {
-            // set the visible region as empty since we have removed the
-            // layerstack check in rebuildLayerStack() function.
-            Region visibleNonTransRegion;
-            visibleNonTransRegion.set(Rect(0,0));
-            layer->setVisibleNonTransparentRegion(visibleNonTransRegion);
-            continue;
-        }
+
         /*
          * opaqueRegion: area of a surface that is fully opaque.
          */
@@ -2100,24 +1762,6 @@ void SurfaceFlinger::doDisplayComposition(const sp<const DisplayDevice>& hw,
     hw->swapBuffers(getHwComposer());
 }
 
-#ifdef QCOM_BSP
-bool SurfaceFlinger::computeTiledDr(const sp<const DisplayDevice>& hw) {
-    int fbWidth= hw->getWidth();
-    int fbHeight= hw->getHeight();
-    Rect fullScreenRect = Rect(0,0,fbWidth, fbHeight);
-    const int32_t id = hw->getHwcDisplayId();
-    mUnionDirtyRect.clear();
-    HWComposer& hwc(getHwComposer());
-
-    /* Compute and return the Union of Dirty Rects.
-     * Return false if the unionDR is fullscreen, as there is no benefit from
-     * preserving full screen.*/
-    return (hwc.canUseTiledDR(id, mUnionDirtyRect) &&
-          (mUnionDirtyRect != fullScreenRect));
-
-}
-#endif
-
 bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const Region& dirty)
 {
     RenderEngine& engine(getRenderEngine());
@@ -2126,9 +1770,7 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
     HWComposer::LayerListIterator cur = hwc.begin(id);
     const HWComposer::LayerListIterator end = hwc.end(id);
 
-    Region clearRegion;
     bool hasGlesComposition = hwc.hasGlesComposition(id);
-    const bool hasHwcComposition = hwc.hasHwcComposition(id);
     if (hasGlesComposition) {
         if (!hw->makeCurrent(mEGLDisplay, mEGLContext)) {
             ALOGW("DisplayDevice::makeCurrent failed. Aborting surface composition for display %s",
@@ -2141,14 +1783,14 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
         }
 
         // Never touch the framebuffer if we don't have any framebuffer layers
+        const bool hasHwcComposition = hwc.hasHwcComposition(id);
         if (hasHwcComposition) {
             // when using overlays, we assume a fully transparent framebuffer
             // NOTE: we could reduce how much we need to clear, for instance
             // remove where there are opaque FB layers. however, on some
             // GPUs doing a "clean slate" clear might be more efficient.
             // We'll revisit later if needed.
-            if(!(mGpuTileRenderEnable && (mDisplays.size()==1)))
-                engine.clearWithColor(0, 0, 0, 0);
+            engine.clearWithColor(0, 0, 0, 0);
         } else {
             // we start with the whole screen area
             const Region bounds(hw->getBounds());
@@ -2164,31 +1806,10 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
             // but limit it to the dirty region
             region.andSelf(dirty);
 
-
             // screen is already cleared here
-#ifdef QCOM_BSP
-            clearRegion.clear();
-            if(mGpuTileRenderEnable && (mDisplays.size()==1)) {
-                clearRegion = region;
-                if (cur == end) {
-                    drawWormhole(hw, region);
-                } else if(mCanUseGpuTileRender) {
-                   /* If GPUTileRect DR optimization on clear only the UnionDR
-                    * (computed by computeTiledDr) which is the actual region
-                    * that will be drawn on FB in this cycle.. */
-                    clearRegion = clearRegion.andSelf(Region(mUnionDirtyRect));
-                }
-            } else
-#endif
-            {
-                if (!region.isEmpty()) {
-                    if (cur != end) {
-                        if (cur->getCompositionType() != HWC_BLIT)
-                            // can happen with SurfaceView
-                            drawWormhole(hw, region);
-                    } else
-                        drawWormhole(hw, region);
-                }
+            if (!region.isEmpty()) {
+                // can happen with SurfaceView
+                drawWormhole(hw, region);
             }
         }
 
@@ -2220,47 +1841,6 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
     const Transform& tr = hw->getTransform();
     if (cur != end) {
         // we're using h/w composer
-#ifdef QCOM_BSP
-        int fbWidth= hw->getWidth();
-        int fbHeight= hw->getHeight();
-        /* if GPUTileRender optimization property is on & can be used
-         * i) Enable EGL_SWAP_PRESERVED flag
-         * ii) do startTile with union DirtyRect
-         * else , Disable EGL_SWAP_PRESERVED */
-        if(mGpuTileRenderEnable && (mDisplays.size()==1)) {
-            if(mCanUseGpuTileRender && !mUnionDirtyRect.isEmpty()) {
-                hw->eglSwapPreserved(true);
-                Rect dr = mUnionDirtyRect;
-                engine.startTileComposition(dr.left, (fbHeight-dr.bottom),
-                      (dr.right-dr.left),
-                      (dr.bottom-dr.top), 0);
-            } else {
-                // Un Set EGL_SWAP_PRESERVED flag, if no tiling required.
-                hw->eglSwapPreserved(false);
-            }
-            // DrawWormHole/Any Draw has to be within startTile & EndTile
-            if (hasGlesComposition) {
-                if (hasHwcComposition) {
-                    if(mCanUseGpuTileRender && !mUnionDirtyRect.isEmpty()) {
-                        const Rect& scissor(mUnionDirtyRect);
-                        engine.setScissor(scissor.left,
-                              hw->getHeight()- scissor.bottom,
-                              scissor.getWidth(), scissor.getHeight());
-                        engine.clearWithColor(0, 0, 0, 0);
-                        engine.disableScissor();
-                    } else {
-                        engine.clearWithColor(0, 0, 0, 0);
-                    }
-                } else {
-                    if (cur->getCompositionType() != HWC_BLIT &&
-                          !clearRegion.isEmpty()) {
-                        drawWormhole(hw, clearRegion);
-                    }
-                }
-            }
-        }
-#endif
-
         for (size_t i=0 ; i<count && cur!=end ; ++i, ++cur) {
             const sp<Layer>& layer(layers[i]);
             const Region clip(dirty.intersect(tr.transform(layer->visibleRegion)));
@@ -2283,9 +1863,6 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
                         layer->draw(hw, clip);
                         break;
                     }
-                    case HWC_BLIT:
-                        //Do nothing
-                        break;
                     case HWC_FRAMEBUFFER_TARGET: {
                         // this should not happen as the iterator shouldn't
                         // let us get there.
@@ -2296,15 +1873,6 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
             }
             layer->setAcquireFence(hw, *cur);
         }
-
-#ifdef QCOM_BSP
-        // call EndTile, if starTile has been called in this cycle.
-        if(mGpuTileRenderEnable && (mDisplays.size()==1)) {
-            if(mCanUseGpuTileRender && !mUnionDirtyRect.isEmpty()) {
-                engine.endTileComposition(GL_PRESERVE);
-            }
-        }
-#endif
     } else {
         // we're not using h/w composer
         for (size_t i=0 ; i<count ; ++i) {
@@ -2376,29 +1944,6 @@ void SurfaceFlinger::setTransactionState(
         uint32_t flags)
 {
     ATRACE_CALL();
-    size_t count = displays.size();
-#ifdef QCOM_BSP
-    // Delay the display projection transaction by 50ms only when the disable
-    // external rotation animation feature is enabled
-    if(mDisableExtAnimation) {
-        for (size_t i=0 ; i<count ; i++) {
-            const DisplayState& s(displays[i]);
-            if((mDisplays.indexOfKey(s.token) >= 0) && (s.token !=
-                    mBuiltinDisplays[DisplayDevice::DISPLAY_PRIMARY])) {
-                const uint32_t what = s.what;
-                // Invalidate and Delay the binder thread by 50 ms on
-                // eDisplayProjectionChanged to trigger a draw cycle so that
-                // it can fix one incorrect frame on the External, when we
-                // disable external animation
-                if (what & DisplayState::eDisplayProjectionChanged) {
-                    invalidateHwcGeometry();
-                    repaintEverything();
-                    usleep(50000);
-                }
-            }
-        }
-    }
-#endif
     Mutex::Autolock _l(mStateLock);
     uint32_t transactionFlags = 0;
 
@@ -2418,6 +1963,7 @@ void SurfaceFlinger::setTransactionState(
         }
     }
 
+    size_t count = displays.size();
     for (size_t i=0 ; i<count ; i++) {
         const DisplayState& s(displays[i]);
         transactionFlags |= setDisplayStateLocked(s);
@@ -2561,8 +2107,7 @@ uint32_t SurfaceFlinger::setClientStateLocked(
                 flags |= eTraversalNeeded;
         }
         if ((what & layer_state_t::eVisibilityChanged) ||
-                (what & layer_state_t::eOpacityChanged) ||
-                (what & layer_state_t::eTransparencyChanged)) {
+                (what & layer_state_t::eOpacityChanged)) {
             // TODO: should we just use an eFlagsChanged for this?
             if (layer->setFlags(s.flags, s.mask))
                 flags |= eTraversalNeeded;
@@ -3163,18 +2708,12 @@ status_t SurfaceFlinger::onTransact(
             break;
         }
         case CAPTURE_SCREEN:
-#ifdef USE_MHEAP_SCREENSHOT
-        case CAPTURE_SCREEN_DEPRECATED:
-#endif
         {
             // codes that require permission check
             IPCThreadState* ipc = IPCThreadState::self();
             const int pid = ipc->getCallingPid();
             const int uid = ipc->getCallingUid();
             if ((uid != AID_GRAPHICS) &&
-#ifdef USE_MHEAP_SCREENSHOT
-                 (uid != AID_SYSTEM) &&
-#endif
                     !PermissionCache::checkPermission(sReadFramebuffer, pid, uid)) {
                 ALOGE("Permission Denial: "
                         "can't read framebuffer pid=%d, uid=%d", pid, uid);
@@ -3495,18 +3034,9 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
             Mutex::Autolock _l(flinger->mStateLock);
             sp<const DisplayDevice> hw(flinger->getDisplayDevice(display));
             bool useReadPixels = this->useReadPixels && !flinger->mGpuToCpuSupported;
-#ifdef USE_MHEAP_SCREENSHOT
-            if (!useReadPixels) {
-#endif
-                result = flinger->captureScreenImplLocked(hw, producer,
-                        sourceCrop, reqWidth, reqHeight, minLayerZ, maxLayerZ,
-                        useIdentityTransform, rotation, useReadPixels);
-#ifdef USE_MHEAP_SCREENSHOT
-            } else {
-                // Should never get here
-                return BAD_VALUE;
-            }
-#endif
+            result = flinger->captureScreenImplLocked(hw, producer,
+                    sourceCrop, reqWidth, reqHeight, minLayerZ, maxLayerZ,
+                    useIdentityTransform, rotation, useReadPixels);
             static_cast<GraphicProducerWrapper*>(producer->asBinder().get())->exit(result);
             return true;
         }
@@ -3577,12 +3107,6 @@ void SurfaceFlinger::renderScreenImplLocked(
     // make sure to clear all GL error flags
     engine.checkErrors();
 
-    if (DisplayDevice::DISPLAY_PRIMARY == hw->getDisplayType() &&
-                hw->isPanelInverseMounted()) {
-        rotation = (Transform::orientation_flags)
-                (rotation ^ Transform::ROT_180);
-    }
-
     // set-up our viewport
     engine.setViewportAndProjection(
         reqWidth, reqHeight, sourceCrop, hw_h, yswap, rotation);
@@ -3598,26 +3122,9 @@ void SurfaceFlinger::renderScreenImplLocked(
         const Layer::State& state(layer->getDrawingState());
         if (state.layerStack == hw->getLayerStack()) {
             if (state.z >= minLayerZ && state.z <= maxLayerZ) {
-#ifdef QCOM_BSP
-                // dont render the secure Display Layer
-                if(layer->isSecureDisplay()) {
-                    continue;
-                }
-#endif
-#ifdef QCOM_BSP
-                int dispType = hw->getDisplayType();
-                // Dont let ext_only and extended_mode to be captured
-                // If not, we would see incorrect image during rotatoin
-                // on primary
-                if (layer->isVisible() &&
-                    not (!dispType && (layer->isExtOnly() ||
-                         (isExtendedMode() && layer->isYuvLayer())))) {
-#else
                 if (layer->isVisible()) {
-#endif
                     if (filtering) layer->setFiltering(true);
-                    if(!layer->isProtected())
-                           layer->draw(hw, useIdentityTransform);
+                    layer->draw(hw, useIdentityTransform);
                     if (filtering) layer->setFiltering(false);
                 }
             }
@@ -3705,7 +3212,6 @@ status_t SurfaceFlinger::captureScreenImplLocked(
                         }
                         if (sync != EGL_NO_SYNC_KHR) {
                             // get the sync fd
-                            getRenderEngine().flush();
                             syncFd = eglDupNativeFenceFDANDROID(mEGLDisplay, sync);
                             if (syncFd == EGL_NO_NATIVE_FENCE_FD_ANDROID) {
                                 ALOGW("captureScreen: failed to dup sync khr object");
@@ -3730,6 +3236,7 @@ status_t SurfaceFlinger::captureScreenImplLocked(
                                 ALOGW("captureScreen: error creating EGL fence: %#x", eglGetError());
                             }
                         }
+
                         if (useReadPixels) {
                             sp<GraphicBuffer> buf = static_cast<GraphicBuffer*>(buffer);
                             void* vaddr;
@@ -3738,6 +3245,7 @@ status_t SurfaceFlinger::captureScreenImplLocked(
                                 buf->unlock();
                             }
                         }
+
                         if (DEBUG_SCREENSHOTS) {
                             uint32_t* pixels = new uint32_t[reqWidth*reqHeight];
                             getRenderEngine().readPixels(0, 0, reqWidth, reqHeight, pixels);
@@ -3795,139 +3303,6 @@ void SurfaceFlinger::checkScreenshot(size_t w, size_t s, size_t h, void const* v
     }
 }
 
-#ifdef USE_MHEAP_SCREENSHOT
-status_t SurfaceFlinger::captureScreenImplCpuConsumerLocked(
-        const sp<const DisplayDevice>& hw,
-        sp<IMemoryHeap>* heap, uint32_t* w, uint32_t* h,
-        Rect sourceCrop, uint32_t reqWidth, uint32_t reqHeight,
-        uint32_t minLayerZ, uint32_t maxLayerZ,
-        bool useIdentityTransform, Transform::orientation_flags rotation)
-{
-    ATRACE_CALL();
-
-    // get screen geometry
-    const uint32_t hw_w = hw->getWidth();
-    const uint32_t hw_h = hw->getHeight();
-
-    if ((reqWidth > hw_w) || (reqHeight > hw_h)) {
-        ALOGE("size mismatch (%d, %d) > (%d, %d)",
-                reqWidth, reqHeight, hw_w, hw_h);
-        return BAD_VALUE;
-    }
-
-    reqWidth  = (!reqWidth)  ? hw_w : reqWidth;
-    reqHeight = (!reqHeight) ? hw_h : reqHeight;
-
-    status_t result = NO_ERROR;
-
-    renderScreenImplLocked(
-        hw, sourceCrop, reqWidth, reqHeight, minLayerZ, maxLayerZ, true,
-        useIdentityTransform, rotation);
-
-    size_t size = reqWidth * reqHeight * 4;
-    // allocate shared memory large enough to hold the
-    // screen capture
-    sp<MemoryHeapBase> base(
-            new MemoryHeapBase(size, 0, "screen-capture") );
-    void *vaddr = base->getBase();
-    glReadPixels(0, 0, reqWidth, reqHeight,
-            GL_RGBA, GL_UNSIGNED_BYTE, vaddr);
-    if (glGetError() == GL_NO_ERROR) {
-        *heap = base;
-        *w = reqWidth;
-        *h = reqHeight;
-        result = NO_ERROR;
-    } else {
-        result = INVALID_OPERATION;
-    }
-
-    return result;
-}
-
-status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
-        sp<IMemoryHeap>* heap, uint32_t* outWidth, uint32_t* outHeight,
-        Rect sourceCrop, uint32_t reqWidth, uint32_t reqHeight,
-        uint32_t minLayerZ, uint32_t maxLayerZ,
-        bool useIdentityTransform, ISurfaceComposer::Rotation rotation)
-{
-    if (CC_UNLIKELY(display == 0))
-        return BAD_VALUE;
-
-    // Convert to surfaceflinger's internal rotation type.
-    Transform::orientation_flags rotationFlags;
-    switch (rotation) {
-        case ISurfaceComposer::eRotateNone:
-            rotationFlags = Transform::ROT_0;
-            break;
-        case ISurfaceComposer::eRotate90:
-            rotationFlags = Transform::ROT_90;
-            break;
-        case ISurfaceComposer::eRotate180:
-            rotationFlags = Transform::ROT_180;
-            break;
-        case ISurfaceComposer::eRotate270:
-            rotationFlags = Transform::ROT_270;
-            break;
-        default:
-            rotationFlags = Transform::ROT_0;
-            ALOGE("Invalid rotation passed to captureScreen(): %d\n", rotation);
-            break;
-    }
-
-    class MessageCaptureScreen : public MessageBase {
-        SurfaceFlinger* flinger;
-        sp<IBinder> display;
-        sp<IMemoryHeap>* heap;
-        uint32_t* outWidth;
-        uint32_t* outHeight;
-        Rect sourceCrop;
-        uint32_t reqWidth, reqHeight;
-        uint32_t minLayerZ,maxLayerZ;
-        bool useIdentityTransform;
-        Transform::orientation_flags rotation;
-        status_t result;
-    public:
-        MessageCaptureScreen(SurfaceFlinger* flinger,
-                const sp<IBinder>& display, sp<IMemoryHeap>* heap,
-                uint32_t* outWidth, uint32_t* outHeight,
-                Rect sourceCrop, uint32_t reqWidth, uint32_t reqHeight,
-                uint32_t minLayerZ, uint32_t maxLayerZ,
-                bool useIdentityTransform, Transform::orientation_flags rotation)
-            : flinger(flinger), display(display), heap(heap),
-              outWidth(outWidth), outHeight(outHeight),
-              sourceCrop(sourceCrop), reqWidth(reqWidth), reqHeight(reqHeight),
-              minLayerZ(minLayerZ), maxLayerZ(maxLayerZ),
-              useIdentityTransform(useIdentityTransform),
-              rotation(rotation),
-              result(PERMISSION_DENIED)
-        {
-        }
-        status_t getResult() const {
-            return result;
-        }
-        virtual bool handler() {
-            Mutex::Autolock _l(flinger->mStateLock);
-            sp<const DisplayDevice> hw(flinger->getDisplayDevice(display));
-            result = flinger->captureScreenImplCpuConsumerLocked(hw, heap,
-                    outWidth, outHeight,
-                    sourceCrop, reqWidth, reqHeight, minLayerZ, maxLayerZ,
-                    useIdentityTransform, rotation);
-            return true;
-        }
-    };
-
-    sp<MessageBase> msg = new MessageCaptureScreen(this, display, heap,
-            outWidth, outHeight,
-            sourceCrop, reqWidth, reqHeight, minLayerZ, maxLayerZ,
-            useIdentityTransform, rotationFlags);
-    status_t res = postMessageSync(msg);
-    if (res == NO_ERROR) {
-        res = static_cast<MessageCaptureScreen*>( msg.get() )->getResult();
-    }
-    return res;
-}
-#endif
-
 // ---------------------------------------------------------------------------
 
 SurfaceFlinger::LayerVector::LayerVector() {
@@ -3974,12 +3349,10 @@ SurfaceFlinger::DisplayDeviceState::DisplayDeviceState(DisplayDevice::DisplayTyp
 }; // namespace android
 
 
-#ifndef USE_MHEAP_SCREENSHOT
 #if defined(__gl_h_)
 #error "don't include gl/gl.h in this file"
 #endif
 
 #if defined(__gl2_h_)
 #error "don't include gl2/gl2.h in this file"
-#endif
 #endif

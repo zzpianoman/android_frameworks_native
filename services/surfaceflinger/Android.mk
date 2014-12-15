@@ -51,16 +51,16 @@ ifeq ($(TARGET_DISABLE_TRIPLE_BUFFERING),true)
 	LOCAL_CFLAGS += -DTARGET_DISABLE_TRIPLE_BUFFERING
 endif
 
+ifeq ($(TARGET_FORCE_HWC_FOR_VIRTUAL_DISPLAYS),true)
+    LOCAL_CFLAGS += -DFORCE_HWC_COPY_FOR_VIRTUAL_DISPLAYS
+endif
+
 ifneq ($(NUM_FRAMEBUFFER_SURFACE_BUFFERS),)
   LOCAL_CFLAGS += -DNUM_FRAMEBUFFER_SURFACE_BUFFERS=$(NUM_FRAMEBUFFER_SURFACE_BUFFERS)
 endif
 
 ifeq ($(TARGET_RUNNING_WITHOUT_SYNC_FRAMEWORK),true)
     LOCAL_CFLAGS += -DRUNNING_WITHOUT_SYNC_FRAMEWORK
-endif
-
-ifeq ($(BOARD_USE_MHEAP_SCREENSHOT),true)
-    LOCAL_CFLAGS += -DUSE_MHEAP_SCREENSHOT
 endif
 
 # See build/target/board/generic/BoardConfig.mk for a description of this setting.
@@ -99,13 +99,6 @@ LOCAL_SHARED_LIBRARIES := \
 	libui \
 	libgui \
 	libpowermanager
-
-ifeq ($(TARGET_USES_QCOM_BSP), true)
-    LOCAL_C_INCLUDES += $(call project-path-for,qcom-display)/libgralloc
-    LOCAL_C_INCLUDES += $(call project-path-for,qcom-display)/libqdutils
-    LOCAL_SHARED_LIBRARIES += libqdutils
-    LOCAL_CFLAGS += -DQCOM_BSP
-endif
 
 LOCAL_MODULE:= libsurfaceflinger
 
