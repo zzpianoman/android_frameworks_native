@@ -2182,12 +2182,7 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
 #endif
             {
                 if (!region.isEmpty()) {
-                    if (cur != end) {
-                        if (cur->getCompositionType() != HWC_BLIT)
-                            // can happen with SurfaceView
-                            drawWormhole(hw, region);
-                    } else
-                        drawWormhole(hw, region);
+                         drawWormhole(hw, region);
                 }
             }
         }
@@ -2252,8 +2247,7 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
                         engine.clearWithColor(0, 0, 0, 0);
                     }
                 } else {
-                    if (cur->getCompositionType() != HWC_BLIT &&
-                          !clearRegion.isEmpty()) {
+                    if (!clearRegion.isEmpty()) {
                         drawWormhole(hw, clearRegion);
                     }
                 }
@@ -2283,9 +2277,6 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
                         layer->draw(hw, clip);
                         break;
                     }
-                    case HWC_BLIT:
-                        //Do nothing
-                        break;
                     case HWC_FRAMEBUFFER_TARGET: {
                         // this should not happen as the iterator shouldn't
                         // let us get there.
