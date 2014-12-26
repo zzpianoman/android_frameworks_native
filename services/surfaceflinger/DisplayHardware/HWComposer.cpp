@@ -591,10 +591,7 @@ void HWComposer::eventControl(int disp, int event, int enabled) {
                 mVSyncThread->setEnabled(enabled);
             }
             break;
-        case EVENT_ORIENTATION:
-            // Orientation event
-            err = mHwc->eventControl(mHwc, disp, event, enabled);
-            break;
+        
         default:
             ALOGW("eventControl got unexpected event %d (disp=%d en=%d)",
                     event, disp, enabled);
@@ -760,12 +757,7 @@ status_t HWComposer::prepare() {
                     }
                     // If the composition type is BLIT, we set this to
                     // trigger a FLIP
-                    if(l.compositionType == HWC_BLIT) {
-                        disp.hasFbComp = true;
-#ifdef QCOM_BSP
-                        disp.hasBlitComp = true;
-#endif
-                    }
+                    
                     if (l.compositionType == HWC_OVERLAY) {
                         disp.hasOvComp = true;
                     }
@@ -1090,13 +1082,7 @@ public:
             }
         }
     }
-    virtual void setAnimating(bool animating) {
-        if (animating) {
-            getLayer()->flags |= HWC_SCREENSHOT_ANIMATOR_LAYER;
-        } else {
-            getLayer()->flags &= ~HWC_SCREENSHOT_ANIMATOR_LAYER;
-        }
-    }
+    
     virtual void setBlending(uint32_t blending) {
         getLayer()->blending = blending;
     }

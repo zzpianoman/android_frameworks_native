@@ -179,7 +179,6 @@ public:
         virtual void setDefaultState() = 0;
         virtual void setSkip(bool skip) = 0;
         virtual void setIsCursorLayerHint(bool isCursor = true) = 0;
-        virtual void setAnimating(bool animating) = 0;
         virtual void setBlending(uint32_t blending) = 0;
         virtual void setTransform(uint32_t transform) = 0;
         virtual void setFrame(const Rect& frame) = 0;
@@ -266,7 +265,7 @@ public:
 
     enum {
         EVENT_VSYNC = HWC_EVENT_VSYNC,
-        EVENT_ORIENTATION = HWC_EVENT_ORIENTATION
+        
     };
 
     void eventControl(int disp, int event, int enabled);
